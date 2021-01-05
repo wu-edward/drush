@@ -25,6 +25,7 @@
  */
 
 use Drupal\Core\Database\Database;
+use Drush\Drupal\Commands\core\BatchCommands;
 use Drush\Drush;
 use Drush\Log\LogLevel;
 
@@ -91,13 +92,15 @@ function drush_backend_batch_process($command = 'batch-process', $args = [], $op
  *
  * @param int $id
  *   The batch ID of the batch being processed.
+ * @param int $time_limit
+ *   Maximum amount of time the batch worker can take in seconds.
  *
  * @return bool|array
  *   A results array.
  */
-function drush_batch_command($id) {
+function drush_batch_command($id, $time_limit = BatchCommands::DEFAULT_BATCH_WORKER_TIME_LIMIT) {
   include_once(DRUSH_DRUPAL_CORE . '/includes/batch.inc');
-  return _drush_batch_command($id);
+  return _drush_batch_command($id, $time_limit);
 }
 
 /**
@@ -148,13 +151,17 @@ function _drush_backend_batch_process($command = 'batch-process', $args = [], $o
     $batch_storage->create($batch);
     $finished = FALSE;
 
-    while (!$finished) {
-      $process = Drush::drush(Drush::aliasManager()->getSelf(), $command, $args);
+    do  {
+      $process = Drush::drush(Drush::aliasManager()->getSelf(), $command, $args, $options);
       // Suppress printing stdout since a JSON array is returned to us here.
       $process->run($process->showRealtime()->hideStdout());
       $result = $process->getOutputAsJson();
       $finished = !$process->isSuccessful() || (isset($result['drush_batch_process_finished']) && $result['drush_batch_process_finished'] === TRUE);
     }
+    // Before running child process in each iteration, load batch from storage.
+    // This is so that a database operation runs on the main process and
+    // prevents a database wait timeout.
+    while (!$finished && $batch_storage->load($batch['id']));
   }
 
   return $result;
@@ -169,11 +176,13 @@ function _drush_backend_batch_process($command = 'batch-process', $args = [], $o
  *
  * @param id
  *   The batch id of the batch being processed.
+ * @param int $time_limit
+ *   Maximum amount of time the batch worker can take in seconds.
  *
  * @return bool|array
  *   A results array.
  */
-function _drush_batch_command($id) {
+function _drush_batch_command($id, $time_limit = \Drush\Drupal\Commands\core\BatchCommands::DEFAULT_BATCH_WORKER_TIME_LIMIT) {
   $batch =& batch_get();
 
   $data = Database::getConnection()->select('batch', 'b')
@@ -196,7 +205,7 @@ function _drush_batch_command($id) {
   // Register database update for end of processing.
   register_shutdown_function('_drush_batch_shutdown');
 
-  if (_drush_batch_worker()) {
+  if (_drush_batch_worker($time_limit)) {
     return _drush_batch_finished();
   }
   else {
@@ -211,8 +220,11 @@ function _drush_batch_command($id) {
  * Using the current $batch process each of the operations until the batch
  * has been completed or 60% of the available memory for the process has been
  * reached.
+ *
+ * @param int $time_limit
+ *   Maximum amount of time the batch worker can take in seconds.
  */
-function _drush_batch_worker() {
+function _drush_batch_worker($time_limit = BatchCommands::DEFAULT_BATCH_WORKER_TIME_LIMIT) {
   $batch =& batch_get();
   $current_set =& _batch_current_set();
   $set_changed = TRUE;
@@ -220,6 +232,7 @@ function _drush_batch_worker() {
   if (empty($current_set['start'])) {
     $current_set['start'] = microtime(TRUE);
   }
+  $process_start = microtime(TRUE);
   $queue = _batch_queue($current_set);
   while (!$current_set['success']) {
     // If this is the first time we iterate this batch set in the current
@@ -290,6 +303,19 @@ function _drush_batch_worker() {
     // is reached.
     if (drush_memory_limit() > 0 && (memory_get_usage() * 1.6) >= drush_memory_limit()) {
       Drush::logger()->notice(dt("Batch process has consumed in excess of 60% of available memory. Starting new thread"));
+      // Record elapsed wall clock time.
+      $current_set['elapsed'] = round((microtime(TRUE) - $current_set['start']) * 1000, 2);
+      break;
+    }
+
+    // Stop current worker process if time limit is close (within 30 seconds).
+    // This is so batch process will return to the main process to prevent a
+    // database wait timeout.
+    $elapsed = round((microtime(TRUE) - $process_start) * 1000, 2);
+    if ($elapsed > ($time_limit - 30)) {
+      Drush::logger()->notice(dt("Batch process has exceeded max run time of !time_limit seconds. Starting new thread", [
+        '!time_limit' => $time_limit,
+      ]));
       // Record elapsed wall clock time.
       $current_set['elapsed'] = round((microtime(TRUE) - $current_set['start']) * 1000, 2);
       break;

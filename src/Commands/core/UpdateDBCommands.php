@@ -2,6 +2,7 @@
 namespace Drush\Commands\core;
 
 use Consolidation\Log\ConsoleLogLevel;
+use Drush\Drupal\Commands\core\BatchCommands;
 use Drush\Drupal\DrupalUtil;
 use DrushBatchContext;
 use Consolidation\OutputFormatters\StructuredData\RowsOfFields;
@@ -157,15 +158,20 @@ class UpdateDBCommands extends DrushCommands implements SiteAliasManagerAwareInt
      *
      * @command updatedb:batch-process
      * @param string $batch_id The batch id that will be processed.
+     * @option int $time_limit Maximum amount of time the batch worker can take
+     *   in seconds.
      * @bootstrap full
      * @kernel update
      * @hidden
      *
      * @return \Consolidation\OutputFormatters\StructuredData\UnstructuredListData
      */
-    public function process($batch_id, $options = ['format' => 'json'])
+    public function process($batch_id, $options = ['format' => 'json', 'time_limit' => NULL])
     {
-        $result = drush_batch_command($batch_id);
+        if (!isset($options['time_limit'])) {
+            $options['time_limit'] = getenv('DRUSH_BATCH_WORKER_TIME_LIMIT') ?: BatchCommands::DEFAULT_BATCH_WORKER_TIME_LIMIT;
+        }
+        $result = drush_batch_command($batch_id, $options['time_limit']);
         return new UnstructuredListData($result);
     }
 
@@ -339,7 +345,7 @@ class UpdateDBCommands extends DrushCommands implements SiteAliasManagerAwareInt
                 '@filename' => "$filename.php",
             ]));
         }
-        
+
         if (isset($context['sandbox']['#finished'])) {
             $context['finished'] = $context['sandbox']['#finished'];
             unset($context['sandbox']['#finished']);
